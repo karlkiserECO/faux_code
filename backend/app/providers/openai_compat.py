@@ -150,7 +150,21 @@ class OpenAICompatProvider:
         if req.tools:
             payload["tools"] = _tools_to_openai(req.tools)
             payload["tool_choice"] = "auto"
+        # Defensive stop sequences: only true end-of-turn tokens. We don't add
+        # <|im_start|> here because some Qwen variants emit it as a separator
+        # between multiple tool calls inside one completion; stopping there
+        # would silently drop the model's follow-up call.
+        default_stops = ["<|im_end|>", "<|endoftext|>"]
+        existing_stops = req.extra.get("stop") if req.extra else None
+        if isinstance(existing_stops, list):
+            payload["stop"] = list({*existing_stops, *default_stops})
+        elif isinstance(existing_stops, str):
+            payload["stop"] = list({existing_stops, *default_stops})
+        else:
+            payload["stop"] = default_stops
         for k, v in (req.extra or {}).items():
+            if k == "stop":
+                continue
             payload[k] = v
 
         async with httpx.AsyncClient(timeout=None) as client:

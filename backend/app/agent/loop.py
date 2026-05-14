@@ -67,9 +67,10 @@ DEFAULT_AGENT_SYSTEM = """\
 You are faux_code, an autonomous AI engineer running on the user's machine. You can:
 
 - Read and search files in the workspace (tools: list_dir, read_file, grep)
-- Edit files (tools: write_file, edit_file)
+- Edit files (tools: write_file, edit_file, apply_patch)
 - Run shell commands (tool: shell) for git, build, test, etc.
-- Run Python snippets (tool: python)
+- Run Python snippets (tool: python) -- this always works, no PATH worries
+- Inspect git state (tools: git_status, git_diff, git_log)
 - Search the public web (tool: web_search) and fetch pages (tool: web_fetch)
 - Search the local knowledge base (tool: rag_search)
 
@@ -78,8 +79,13 @@ Working style:
 2. Read before you write. Use `read_file` or `grep` before editing.
 3. After making changes, validate with `shell` (run tests, type-check, lint).
 4. When done, finish with a concise summary of what changed and why.
-5. Never invent file paths — always confirm with `list_dir` first.
+5. Never invent file paths -- always confirm with `list_dir` first.
 6. If a tool returns an error, read it and fix the approach instead of retrying blindly.
+
+Environment notes:
+- macOS may not have `python` on PATH; prefer the `python` tool, or call `python3` in shell.
+- Use the `apply_patch` tool when changes span multiple files.
+- Multi-step refactors: read all affected files first, then edit each, then verify with shell.
 """
 
 
@@ -135,6 +141,7 @@ class AgentLoop:
     async def run(self) -> AsyncIterator[AgentEvent]:
         yield AgentEvent(AgentEventKind.STATUS, {"status": "running", "model": self.model})
 
+        empty_streak = 0
         for step in range(self.max_steps):
             req = ChatRequest(
                 model=self.model,
@@ -183,6 +190,16 @@ class AgentLoop:
                     tool_calls = extra
                     assistant_text = ""  # don't double-render the JSON
 
+            # Scrub leaked template tokens from text we'd show the user.
+            if assistant_text:
+                import re as _re
+
+                assistant_text = _re.sub(
+                    r"<\|(im_start|im_end|endoftext)\|>(?:assistant|user|system)?",
+                    "",
+                    assistant_text,
+                ).strip()
+
             assistant_msg = ChatMessage(
                 role="assistant",
                 content=assistant_text,
@@ -200,6 +217,39 @@ class AgentLoop:
             )
 
             if not tool_calls:
+                looks_like_plan = _looks_like_plan(assistant_text)
+                halluc = _looks_like_hallucinated_tool_output(assistant_text)
+                if (
+                    (not assistant_text.strip() or looks_like_plan or halluc)
+                    and step < self.max_steps - 1
+                    and empty_streak < 2
+                ):
+                    empty_streak += 1
+                    if halluc:
+                        # Don't let the model trust its own fake tool output: replace
+                        # the assistant message content we just appended.
+                        if self.messages and self.messages[-1].role == "assistant":
+                            self.messages[-1].content = (
+                                "[the previous text contained a fabricated tool_response "
+                                "and has been redacted; no tool was actually called]"
+                            )
+                        nudge = (
+                            "Stop. You wrote a fake <tool_response> block. Tools are "
+                            "executed by ME, not you. Do not write tool output text. "
+                            "Issue a real tool call now (or your final answer)."
+                        )
+                    elif looks_like_plan:
+                        nudge = (
+                            "You wrote a plan but did not call a tool. Don't describe "
+                            "what you will do -- DO IT. Call the next tool now."
+                        )
+                    else:
+                        nudge = (
+                            "Please continue working on the goal. Call a tool now, or "
+                            "write your final answer if you're truly done."
+                        )
+                    self.messages.append(ChatMessage(role="user", content=nudge))
+                    continue
                 # Done — model produced a final reply with no tool calls.
                 yield AgentEvent(
                     AgentEventKind.FINISHED,
@@ -210,6 +260,7 @@ class AgentLoop:
                     },
                 )
                 return
+            empty_streak = 0
 
             # Execute each tool call sequentially.
             for tc in tool_calls:
@@ -284,6 +335,60 @@ async def run_agent(**kwargs) -> AsyncIterator[AgentEvent]:
         yield ev
 
 
+_HALLUCINATED_TOOL_RESPONSE_RE = None  # lazy compiled below
+
+
+def _looks_like_hallucinated_tool_output(text: str) -> bool:
+    """Detect when the model pretended to call a tool and made up the response.
+
+    Example: ``<tool_response>### `$ read_file` ...</tool_response>``
+    """
+    if not text:
+        return False
+    global _HALLUCINATED_TOOL_RESPONSE_RE
+    if _HALLUCINATED_TOOL_RESPONSE_RE is None:
+        import re as _re
+
+        _HALLUCINATED_TOOL_RESPONSE_RE = _re.compile(
+            r"<(tool_response|tool_result|observation|tool_output)\b",
+            _re.IGNORECASE,
+        )
+    return bool(_HALLUCINATED_TOOL_RESPONSE_RE.search(text))
+
+
+_PLAN_PATTERNS: list[str] = [
+    r"\blet'?s\s+(read|run|now|first|edit|fix|check|verify|search|grep|try|see|look)",
+    r"\blet\s+me\s+(read|run|now|first|edit|fix|check|verify|search|grep|try|see|look)",
+    r"\bi'?ll\s+(read|run|edit|fix|now|first|next|then|check|verify|search|grep|try|see|look|use|call|do|continue|proceed|update|modify|create|write)",
+    r"\bi\s+will\s+(read|run|edit|fix|now|first|next|then|check|verify|search|grep|try|see|look|use|call|do|continue|proceed|update|modify|create|write)",
+    r"\b(first|next|then|now)\s*,?\s*(i'?ll|i\s+will|let'?s|let\s+me)",
+    r"\bto\s+(fix|do|accomplish|solve|address|resolve|complete)\s+this",
+    r"\bhere'?s\s+the\s+plan",
+    r"\bthe\s+plan\s+is",
+    r"\bstep\s*1\b",
+    r"^\s*1[.)]\s*(read|run|edit|fix|check|verify|search|grep|try|now|first)",
+    r"\bplease\s+confirm",
+    r"\bif\s+confirmed",
+    r"\bdo\s+you\s+want\s+(me\s+to|to)\b",
+    r"\bshould\s+i\b",
+]
+
+
+def _looks_like_plan(text: str) -> bool:
+    """Detect when the model wrote a plan instead of calling a tool."""
+    if not text:
+        return False
+    snippet = text.strip().lower()
+    if len(snippet) > 1200:
+        return False
+    import re as _re
+
+    for pat in _PLAN_PATTERNS:
+        if _re.search(pat, snippet, _re.IGNORECASE | _re.MULTILINE):
+            return True
+    return False
+
+
 def _extract_json_tool_calls(text: str) -> list[ToolCall]:
     """Parse tool calls emitted as JSON in assistant text.
 
@@ -293,6 +398,7 @@ def _extract_json_tool_calls(text: str) -> list[ToolCall]:
       [{"name": "...", "arguments": {...}}, ...]
       ```json\n{...}\n```
       ```tool_call\n{...}\n```
+      Multiple JSON blocks separated by <|im_start|> / <|im_end|> (Qwen leak)
 
     Returns an empty list if nothing tool-call-shaped is found.
     """
@@ -300,55 +406,96 @@ def _extract_json_tool_calls(text: str) -> list[ToolCall]:
     import uuid
 
     text = text.strip()
+    # Remove explicit role-marker tokens — we treat them as block separators.
+    text_no_markers = re.sub(
+        r"<\|(im_start|im_end|endoftext)\|>(?:assistant|user|system)?",
+        "\n",
+        text,
+    )
+
+    out: list[ToolCall] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add_calls(data: Any) -> None:
+        for call in _normalize_tool_call_object(data):
+            key = (call.name, json.dumps(call.arguments, sort_keys=True))
+            if key in seen:
+                continue
+            seen.add(key)
+            if not call.id:
+                call.id = f"call_{uuid.uuid4().hex[:8]}"
+            out.append(call)
+
     candidates: list[str] = []
 
     # Strip fenced code blocks (json / tool_call / tool_use / blank fence).
-    fence_re = re.compile(r"```(?:json|tool_call|tool_use|tool|functions?)?\s*\n?([\s\S]*?)```", re.IGNORECASE)
-    for m in fence_re.finditer(text):
+    fence_re = re.compile(
+        r"```(?:json|tool_call|tool_use|tool|functions?)?\s*\n?([\s\S]*?)```",
+        re.IGNORECASE,
+    )
+    for m in fence_re.finditer(text_no_markers):
         candidates.append(m.group(1).strip())
 
-    # Bare JSON at the start
-    stripped = text
-    for prefix in (
-        "<tool_call>", "<tool_use>", "[TOOL_CALLS]", "TOOL_CALLS:", "Tool call:", "Action:",
-    ):
-        if stripped.lower().startswith(prefix.lower()):
-            stripped = stripped[len(prefix):].strip()
-    if stripped.startswith("{") or stripped.startswith("["):
-        candidates.insert(0, stripped)
+    # Strip <tool_call>...</tool_call> tags.
+    tag_re = re.compile(r"<tool_call>\s*([\s\S]*?)\s*</tool_call>", re.IGNORECASE)
+    for m in tag_re.finditer(text_no_markers):
+        candidates.append(m.group(1).strip())
 
-    out: list[ToolCall] = []
-    seen = set()
+    # The remaining text body — we scan it for all balanced JSON top-level objects.
+    candidates.append(text_no_markers)
+
     for raw in candidates:
-        # Try to find the largest balanced JSON object / array.
-        for start_char, end_char in (("[", "]"), ("{", "}")):
-            i = raw.find(start_char)
-            if i < 0:
-                continue
-            depth = 0
-            for j in range(i, len(raw)):
-                if raw[j] == start_char:
+        _scan_top_level_json(raw, add_calls)
+
+    return out
+
+
+def _scan_top_level_json(text: str, sink) -> None:
+    """Find every balanced top-level JSON object/array in text and pass parsed value to sink."""
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c not in "{[":
+            i += 1
+            continue
+        end_char = "}" if c == "{" else "]"
+        depth = 0
+        in_string = False
+        escape = False
+        j = i
+        while j < n:
+            ch = text[j]
+            if escape:
+                escape = False
+            elif in_string:
+                if ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+            else:
+                if ch == '"':
+                    in_string = True
+                elif ch == c:
                     depth += 1
-                elif raw[j] == end_char:
+                elif ch == end_char:
                     depth -= 1
                     if depth == 0:
-                        chunk = raw[i : j + 1]
+                        chunk = text[i : j + 1]
                         try:
                             data = json.loads(chunk)
+                            sink(data)
                         except json.JSONDecodeError:
-                            break
-                        for call in _normalize_tool_call_object(data):
-                            key = (call.name, json.dumps(call.arguments, sort_keys=True))
-                            if key in seen:
-                                continue
-                            seen.add(key)
-                            if not call.id:
-                                call.id = f"call_{uuid.uuid4().hex[:8]}"
-                            out.append(call)
+                            pass
+                        i = j + 1
                         break
-        if out:
-            break
-    return out
+            j += 1
+        else:
+            # Reached end without closing; advance past this opener.
+            i += 1
+            continue
+        if depth != 0:
+            i += 1
 
 
 def _normalize_tool_call_object(obj: Any) -> list[ToolCall]:

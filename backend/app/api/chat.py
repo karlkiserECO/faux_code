@@ -24,6 +24,10 @@ class ChatCompletionRequest(BaseModel):
     model: str
     messages: list[dict[str, Any]] = Field(default_factory=list)
     tools: list[dict[str, Any]] = Field(default_factory=list)
+    enable_tools: bool = False
+    allowed_tools: Optional[list[str]] = None
+    workspace: Optional[str] = None
+    max_steps: int = 12
     temperature: float = 0.7
     top_p: float = 0.95
     max_tokens: Optional[int] = None
@@ -82,6 +86,18 @@ async def chat_completions(
             )
             session.commit()
 
+    if body.enable_tools:
+        return StreamingResponse(
+            event_stream(
+                _agentic_chat_stream(
+                    body=body,
+                    conversation=conversation,
+                    messages=messages,
+                )
+            ),
+            media_type="text/event-stream",
+        )
+
     tools = [ToolDef(**t) for t in body.tools] if body.tools else []
     req = ChatRequest(
         model=body.model,
@@ -135,6 +151,161 @@ async def chat_completions(
                 session.commit()
 
     return StreamingResponse(event_stream(gen()), media_type="text/event-stream")
+
+
+async def _agentic_chat_stream(
+    *,
+    body: ChatCompletionRequest,
+    conversation: Optional[Conversation],
+    messages: list[ChatMessage],
+):
+    """Drive the agent loop inside a chat conversation and forward unified events."""
+    from ..agent import AgentEventKind, AgentLoop
+    from ..db.session import _get_engine
+    from sqlmodel import Session as _S
+    from datetime import datetime, timezone
+
+    if conversation:
+        yield {"event": "conversation", "data": {"id": conversation.id, "title": conversation.title}}
+
+    history = [m for m in messages if m.role != "user"][:]
+    user_messages = [m for m in messages if m.role == "user"]
+    goal = user_messages[-1].content if user_messages else ""
+    prior = history + user_messages[:-1]
+    system_prompt = body.system_prompt or None
+
+    loop = AgentLoop(
+        provider=body.provider,
+        model=body.model,
+        goal=goal,
+        history=prior,
+        workspace=body.workspace,
+        approval_mode="auto",
+        allowed_tools=body.allowed_tools,
+        max_steps=body.max_steps,
+        system_prompt=system_prompt,
+    )
+
+    final_text = ""
+    tool_events: list[dict[str, Any]] = []
+    buffered_step: int | None = None
+    buffered_text = ""
+    streamed_chars = 0  # how many chars of buffered_text we've already emitted as deltas
+
+    def looks_like_tool_json(s: str) -> bool:
+        """Heuristic: very early in a turn the model is starting JSON-style tool call."""
+        t = s.lstrip()
+        if not t:
+            return False
+        if t.startswith("```"):
+            # Could be ```json or a code block — wait until we see more.
+            head = t[: min(80, len(t))].lower()
+            if "json" in head or "tool" in head or "function" in head:
+                return True
+            # Plain code fence — treat as prose so user sees code.
+            return False
+        if t.startswith("<tool_call>"):
+            return True
+        if t.startswith("{") or t.startswith("["):
+            head = t[: min(120, len(t))]
+            return '"name"' in head or '"tool"' in head or '"function"' in head
+        return False
+
+    try:
+        async for ev in loop.run():
+            if ev.kind == AgentEventKind.ASSISTANT_DELTA:
+                step = ev.payload.get("step", 0)
+                if buffered_step != step:
+                    buffered_step = step
+                    buffered_text = ""
+                    streamed_chars = 0
+                buffered_text += ev.payload.get("delta", "")
+                # Once we've decided it's NOT a tool call, stream the tail through.
+                if streamed_chars and len(buffered_text) > streamed_chars:
+                    new_chunk = buffered_text[streamed_chars:]
+                    streamed_chars = len(buffered_text)
+                    yield {"event": "delta", "data": new_chunk}
+                elif not streamed_chars and len(buffered_text) >= 12:
+                    # Enough characters to decide.
+                    if not looks_like_tool_json(buffered_text):
+                        yield {"event": "delta", "data": buffered_text}
+                        streamed_chars = len(buffered_text)
+            elif ev.kind == AgentEventKind.ASSISTANT_MESSAGE:
+                content = ev.payload.get("content", "")
+                # If we haven't streamed anything but content is real, emit it.
+                if content and streamed_chars == 0:
+                    yield {"event": "delta", "data": content}
+                if content:
+                    final_text = content
+                buffered_step = None
+                buffered_text = ""
+                streamed_chars = 0
+            elif ev.kind == AgentEventKind.TOOL_CALL:
+                tool_events.append(
+                    {
+                        "id": ev.payload.get("id"),
+                        "name": ev.payload.get("name"),
+                        "arguments": ev.payload.get("arguments"),
+                        "step": ev.payload.get("step", 0),
+                        "result": None,
+                    }
+                )
+                yield {"event": "tool_call_started", "data": ev.payload}
+            elif ev.kind == AgentEventKind.TOOL_RESULT:
+                for te in tool_events:
+                    if te["id"] == ev.payload.get("id") and te["result"] is None:
+                        te["result"] = {
+                            "ok": ev.payload.get("ok"),
+                            "is_error": ev.payload.get("is_error"),
+                            "content": ev.payload.get("content"),
+                        }
+                yield {"event": "tool_result", "data": ev.payload}
+            elif ev.kind == AgentEventKind.FINISHED:
+                if ev.payload.get("final"):
+                    final_text = ev.payload["final"]
+                yield {
+                    "event": "finish",
+                    "data": {
+                        "reason": ev.payload.get("status", "completed"),
+                        "usage": None,
+                        "steps_taken": ev.payload.get("steps_taken"),
+                    },
+                }
+            elif ev.kind == AgentEventKind.ERROR:
+                yield {"event": "error", "data": {"message": ev.payload.get("message", "agent error")}}
+    except Exception as exc:
+        yield {"event": "error", "data": {"message": str(exc)}}
+
+    # Persist the final assistant message + tool messages.
+    if conversation and body.persist and (final_text or tool_events):
+        with _S(_get_engine()) as s:
+            for te in tool_events:
+                s.add(
+                    Message(
+                        conversation_id=conversation.id,
+                        role="tool",
+                        content=(te.get("result") or {}).get("content", "") or "",
+                        tool_call_id=te.get("id"),
+                        tool_name=te.get("name"),
+                        tool_args_json=json.dumps(te.get("arguments")) if te.get("arguments") is not None else None,
+                        tool_result_json=json.dumps(te.get("result")) if te.get("result") else None,
+                    )
+                )
+            if final_text:
+                s.add(
+                    Message(
+                        conversation_id=conversation.id,
+                        role="assistant",
+                        content=final_text,
+                        provider=body.provider or "ollama",
+                        model=body.model,
+                    )
+                )
+            conv = s.get(Conversation, conversation.id)
+            if conv:
+                conv.updated_at = datetime.now(timezone.utc)
+                s.add(conv)
+            s.commit()
 
 
 @router.get("/conversations")

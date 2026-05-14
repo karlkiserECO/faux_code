@@ -127,7 +127,9 @@ export type ChatStreamEvent =
   | { event: "conversation"; data: { id: string; title: string } }
   | { event: "delta"; data: string }
   | { event: "tool_call"; data: unknown }
-  | { event: "finish"; data: { reason: string; usage: { input_tokens: number; output_tokens: number } | null } }
+  | { event: "tool_call_started"; data: { id: string; name: string; arguments: any; step: number } }
+  | { event: "tool_result"; data: { id: string; name: string; ok: boolean; is_error?: boolean; content: string; data?: any } }
+  | { event: "finish"; data: { reason: string; usage: { input_tokens: number; output_tokens: number } | null; steps_taken?: number } }
   | { event: "error"; data: { message: string } }
   | { event: "done"; data: "" };
 
@@ -386,6 +388,10 @@ export async function* streamChat(
     tools?: unknown[];
     fallback?: string[];
     temperature?: number;
+    enable_tools?: boolean;
+    allowed_tools?: string[];
+    workspace?: string;
+    max_steps?: number;
   },
   signal?: AbortSignal
 ): AsyncGenerator<ChatStreamEvent> {

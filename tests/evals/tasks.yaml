@@ -1,4 +1,4 @@
-version: 1
+version: 2
 description: |
   Canonical task suite used for cyclic build/test. Each task points at a goal
   the agent must accomplish in a tmpdir workspace, plus a check_script that
@@ -46,3 +46,103 @@ tasks:
       config.py: ["DEBUG = True", "demo"]
     allowed_tools: ["list_dir", "read_file", "edit_file", "write_file"]
     max_steps: 8
+
+  - id: fix_failing_test
+    description: Find and fix a bug to make a test pass.
+    setup_files:
+      "math_utils.py": |
+        def square(n):
+            # Bug: returns n+2 instead of n*n
+            return n + 2
+      "test_math.py": |
+        from math_utils import square
+
+        def test_square():
+            assert square(3) == 9, f"expected 9, got {square(3)}"
+
+        if __name__ == "__main__":
+            test_square()
+            print("OK")
+    goal: |
+      Run `python3 test_math.py` (or use the python tool) to execute test_math.py.
+      It will fail. Read both files, identify the bug in `square` in math_utils.py,
+      fix it, and re-run the test to confirm it now prints OK.
+    expect_text_includes_any: ["OK", "passed"]
+    expect_files:
+      math_utils.py: ["n * n", ]
+    allowed_tools: ["list_dir", "read_file", "edit_file", "write_file", "shell", "python"]
+    max_steps: 15
+
+  - id: grep_and_explain
+    description: Search the workspace for a symbol and explain its purpose.
+    setup_files:
+      "src/parser.py": |
+        def tokenize(text):
+            """Split text into tokens."""
+            return text.split()
+
+        def parse(tokens):
+            return [t.lower() for t in tokens]
+      "src/main.py": |
+        from parser import tokenize, parse
+
+        def run(text):
+            return parse(tokenize(text))
+      "README.md": |
+        # demo
+
+        Pipeline: tokenize -> parse.
+    goal: |
+      Use grep to find all uses of the `tokenize` function in the workspace,
+      then briefly explain in one sentence what `tokenize` does.
+    expect_text_includes_any: ["split", "token", "word"]
+    allowed_tools: ["list_dir", "read_file", "grep"]
+    max_steps: 10
+
+  - id: multi_file_rename
+    description: Rename a function across multiple files.
+    setup_files:
+      "src/utils.py": |
+        def calc_total(items):
+            return sum(items)
+      "src/main.py": |
+        from utils import calc_total
+
+        print(calc_total([1, 2, 3]))
+    goal: |
+      Rename the function `calc_total` to `sum_items` in both `src/utils.py`
+      and `src/main.py`. Read both files first, make the change in both, then
+      run `python -c "import sys; sys.path.insert(0, 'src'); from main import *"` (it should run without error).
+    expect_files:
+      src/utils.py: ["def sum_items"]
+      src/main.py: ["sum_items"]
+    allowed_tools: ["list_dir", "read_file", "edit_file", "write_file", "grep", "shell", "python"]
+    max_steps: 15
+
+  - id: git_commit_workflow
+    description: Initialize a git repo, stage a file, commit it, and use git_status.
+    goal: |
+      Initialize a git repository in the workspace using shell `git init`.
+      Configure user with `git config user.email demo@example.com` and
+      `git config user.name Demo`. Create a file `hello.py` containing
+      `print("hello")`, stage and commit it with the message "first commit",
+      then use the git_status tool to confirm the working tree is clean.
+    expect_text_includes_any: ["clean", "nothing to commit", "branch"]
+    expect_files:
+      hello.py: ["hello"]
+    allowed_tools: ["list_dir", "read_file", "write_file", "shell", "git_status", "git_log"]
+    max_steps: 15
+
+  - id: count_lines
+    description: Quick computation via the python tool.
+    setup_files:
+      "data.txt": |
+        alpha
+        beta
+        gamma
+        delta
+        epsilon
+    goal: "How many lines are in data.txt? Use the python tool to count exactly."
+    expect_text_includes: ["5"]
+    allowed_tools: ["list_dir", "read_file", "python"]
+    max_steps: 6

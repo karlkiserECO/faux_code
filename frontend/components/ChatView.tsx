@@ -14,11 +14,13 @@ import MessageBubble from "./MessageBubble";
 import ModelPicker from "./ModelPicker";
 import ExamplePrompts from "./ExamplePrompts";
 import SystemPromptPicker from "./SystemPromptPicker";
-import { ArrowUp, Square, Zap } from "lucide-react";
+import ToolEvent, { ToolEventState } from "./ToolEvent";
+import { ArrowUp, Square, Zap, Wrench } from "lucide-react";
 
 export default function ChatView({ conversationId }: { conversationId?: string }) {
   const router = useRouter();
-  const { provider, model, systemPrompt, temperature, setSystemPrompt } = useSettingsStore();
+  const { provider, model, systemPrompt, temperature, toolsEnabled, setSystemPrompt, setToolsEnabled } =
+    useSettingsStore();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [streamingText, setStreamingText] = useState("");
@@ -26,6 +28,8 @@ export default function ChatView({ conversationId }: { conversationId?: string }
   const [error, setError] = useState<string | null>(null);
   const [usage, setUsage] = useState<{ input_tokens: number; output_tokens: number } | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [liveToolEvents, setLiveToolEvents] = useState<Record<string, ToolEventState>>({});
+  const [liveToolOrder, setLiveToolOrder] = useState<string[]>([]);
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
@@ -49,6 +53,8 @@ export default function ChatView({ conversationId }: { conversationId?: string }
     setBusy(true);
     setStreamingText("");
     setError(null);
+    setLiveToolEvents({});
+    setLiveToolOrder([]);
     abortRef.current = new AbortController();
     let liveText = "";
     let newConvId: string | undefined = targetConvId;
@@ -63,6 +69,7 @@ export default function ChatView({ conversationId }: { conversationId?: string }
           messages: history,
           system_prompt: systemPrompt,
           temperature,
+          enable_tools: toolsEnabled,
         },
         abortRef.current.signal
       );
@@ -73,6 +80,33 @@ export default function ChatView({ conversationId }: { conversationId?: string }
         } else if (ev.event === "delta") {
           liveText += ev.data as string;
           setStreamingText(liveText);
+        } else if (ev.event === "tool_call_started") {
+          const d = ev.data;
+          setLiveToolEvents((prev) => ({
+            ...prev,
+            [d.id]: {
+              callId: d.id,
+              name: d.name,
+              step: d.step,
+              args: d.arguments,
+            },
+          }));
+          setLiveToolOrder((prev) =>
+            prev.includes(d.id) ? prev : [...prev, d.id]
+          );
+        } else if (ev.event === "tool_result") {
+          const d = ev.data;
+          setLiveToolEvents((prev) => ({
+            ...prev,
+            [d.id]: {
+              ...(prev[d.id] || { callId: d.id, name: d.name, step: 0, args: {} }),
+              result: {
+                ok: d.ok,
+                is_error: d.is_error,
+                content: d.content,
+              },
+            },
+          }));
         } else if (ev.event === "finish") {
           liveUsage = (ev.data as any)?.usage || null;
         } else if (ev.event === "error") {
@@ -91,6 +125,8 @@ export default function ChatView({ conversationId }: { conversationId?: string }
       setMessages((m) => [...m, finalMsg]);
       setUsage(liveUsage);
       setStreamingText("");
+      setLiveToolEvents({});
+      setLiveToolOrder([]);
 
       if (!targetConvId && newConvId) {
         // Fire-and-forget title generation, then route to the new convo.
@@ -212,6 +248,18 @@ export default function ChatView({ conversationId }: { conversationId?: string }
           )}
         </div>
         <div className="flex items-center gap-2">
+          <button
+            onClick={() => setToolsEnabled(!toolsEnabled)}
+            className={`flex items-center gap-1.5 px-2 py-1 rounded-md border text-xs ${
+              toolsEnabled
+                ? "border-accent text-accent bg-accent/10"
+                : "border-border bg-card text-muted hover:text-foreground"
+            }`}
+            title="When on, the assistant can call tools (web search, file ops, shell, python, RAG) inside this chat."
+          >
+            <Wrench size={12} />
+            Tools {toolsEnabled ? "on" : "off"}
+          </button>
           <SystemPromptPicker value={systemPrompt} onChange={setSystemPrompt} />
           <ModelPicker />
         </div>
@@ -256,6 +304,13 @@ export default function ChatView({ conversationId }: { conversationId?: string }
             }
           />
         ))}
+        {liveToolOrder.length > 0 && (
+          <div className="px-4 py-2 space-y-1">
+            {liveToolOrder.map((id) => (
+              <ToolEvent key={id} ev={liveToolEvents[id]} />
+            ))}
+          </div>
+        )}
         {streamingText && (
           <MessageBubble
             message={{ role: "assistant", content: streamingText, provider, model }}
