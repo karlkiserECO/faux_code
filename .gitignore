@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.python-version
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Node
+node_modules/
+.next/
+out/
+dist/
+*.tsbuildinfo
+.npm
+.yarn/
+
+# Env / secrets
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Data
+*.db
+*.sqlite
+*.sqlite3
+backend/data/
+.lancedb/
+workspaces/
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Plans / scratch
+.cursor/
+plans/

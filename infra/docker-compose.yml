@@ -1,0 +1,61 @@
+version: "3.9"
+
+# Optional all-in-one stack. Use this when you want to run faux_code in
+# containers (e.g. on the target deploy machine). Ollama still runs on the host
+# because Apple Silicon GPU pass-through into Docker is unsupported.
+
+services:
+  backend:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.backend
+    container_name: faux-backend
+    restart: unless-stopped
+    environment:
+      FAUX_HOST: 0.0.0.0
+      FAUX_PORT: "8765"
+      FAUX_DATA_DIR: /data
+      FAUX_WORKSPACE_ROOT: /workspaces
+      FAUX_CORS_ORIGINS: "http://localhost:3000,http://127.0.0.1:3000"
+      OLLAMA_BASE_URL: "http://host.docker.internal:11434"
+      OLLAMA_DEFAULT_CHAT: ${OLLAMA_DEFAULT_CHAT:-llama3.1:8b-instruct-q4_K_M}
+      OLLAMA_DEFAULT_CODE: ${OLLAMA_DEFAULT_CODE:-qwen2.5-coder:7b-instruct-q4_K_M}
+      OLLAMA_DEFAULT_EMBED: ${OLLAMA_DEFAULT_EMBED:-nomic-embed-text}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      CEREBRAS_API_KEY: ${CEREBRAS_API_KEY:-}
+      HF_TOKEN: ${HF_TOKEN:-}
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+    ports:
+      - "8765:8765"
+    volumes:
+      - faux_data:/data
+      - ${FAUX_WORKSPACE_MOUNT:-./workspaces}:/workspaces
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/healthz')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  frontend:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.frontend
+    container_name: faux-frontend
+    restart: unless-stopped
+    environment:
+      NEXT_PUBLIC_API_BASE: ${NEXT_PUBLIC_API_BASE:-http://localhost:8765}
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  faux_data:

@@ -1,0 +1,65 @@
+[project]
+name = "faux-code"
+version = "0.1.0"
+description = "Self-hosted multi-provider AI chat and agentic coding workbench"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Karl Kiser", email = "karl.j.kiser@gmail.com" }]
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "httpx>=0.27.2",
+    "pydantic>=2.9.0",
+    "pydantic-settings>=2.5.0",
+    "sqlmodel>=0.0.22",
+    "structlog>=24.4.0",
+    "python-multipart>=0.0.12",
+    "sse-starlette>=2.1.3",
+    "anyio>=4.6.0",
+    "aiofiles>=24.1.0",
+    "tenacity>=9.0.0",
+    "rich>=13.9.0",
+    "typer>=0.13.0",
+    "beautifulsoup4>=4.12.3",
+    "lxml>=5.3.0",
+    "markdownify>=0.13.1",
+    "ddgs>=9.0.0",
+    "lancedb>=0.13.0",
+    "pypdf>=5.1.0",
+    "google-genai>=0.3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-cov>=6.0.0",
+    "ruff>=0.7.0",
+    "mypy>=1.13.0",
+]
+
+[project.scripts]
+faux-code = "cli.faux_code.__main__:main"
+faux-code-server = "backend.app.main:run"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["backend*", "cli*"]
+exclude = ["tests*", "frontend*", "infra*", "workspaces*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "N", "SIM", "RUF"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["backend/tests", "tests"]

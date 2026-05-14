@@ -1,0 +1,48 @@
+version: 1
+description: |
+  Canonical task suite used for cyclic build/test. Each task points at a goal
+  the agent must accomplish in a tmpdir workspace, plus a check_script that
+  exits 0 when the result is correct.
+
+tasks:
+  - id: hello_file
+    description: Read an existing file and answer a question about it.
+    setup_files:
+      "README.md": |
+        # demo
+        The project codename is sapphire.
+    goal: "Read README.md and tell me the project codename."
+    expect_text_includes: ["sapphire"]
+    allowed_tools: ["list_dir", "read_file"]
+    max_steps: 5
+
+  - id: write_python_script
+    description: Write a small Python script and run it.
+    goal: |
+      Create a file `add.py` with a function `add(a, b)` that returns a+b, and
+      a `__main__` block that prints `add(3, 4)`. Then run it with the python
+      tool to confirm output is 7.
+    expect_text_includes: ["7"]
+    expect_files:
+      add.py: ["def add", "3, 4"]
+    allowed_tools: ["list_dir", "read_file", "write_file", "python"]
+    max_steps: 10
+
+  - id: search_and_summarize
+    description: Use the web to answer a knowledge question.
+    goal: "What is the FastAPI project? Use web_search to confirm, give a one-sentence answer."
+    expect_text_includes_any: ["framework", "Python", "API"]
+    allowed_tools: ["web_search", "web_fetch"]
+    max_steps: 6
+
+  - id: edit_existing_file
+    description: Edit a specific line in an existing file.
+    setup_files:
+      "config.py": |
+        DEBUG = False
+        APP_NAME = "demo"
+    goal: 'Change DEBUG = False to DEBUG = True in config.py, then read the file to confirm.'
+    expect_files:
+      config.py: ["DEBUG = True", "demo"]
+    allowed_tools: ["list_dir", "read_file", "edit_file", "write_file"]
+    max_steps: 8
