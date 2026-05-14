@@ -173,6 +173,16 @@ class AgentLoop:
 
             # Emit the assistant message we just got.
             tool_calls = [ac.to_call() for ac in pending.values() if ac.name]
+
+            # Fallback: some models (notably some Qwen variants on Ollama)
+            # emit tool calls as JSON in the text content instead of the
+            # `tool_calls` field. Detect and recover.
+            if not tool_calls and assistant_text:
+                extra = _extract_json_tool_calls(assistant_text)
+                if extra:
+                    tool_calls = extra
+                    assistant_text = ""  # don't double-render the JSON
+
             assistant_msg = ChatMessage(
                 role="assistant",
                 content=assistant_text,
@@ -272,3 +282,109 @@ async def run_agent(**kwargs) -> AsyncIterator[AgentEvent]:
     loop = AgentLoop(**kwargs)
     async for ev in loop.run():
         yield ev
+
+
+def _extract_json_tool_calls(text: str) -> list[ToolCall]:
+    """Parse tool calls emitted as JSON in assistant text.
+
+    Recognizes:
+      {"name": "...", "arguments": {...}}
+      {"name": "...", "parameters": {...}}
+      [{"name": "...", "arguments": {...}}, ...]
+      ```json\n{...}\n```
+      ```tool_call\n{...}\n```
+
+    Returns an empty list if nothing tool-call-shaped is found.
+    """
+    import re
+    import uuid
+
+    text = text.strip()
+    candidates: list[str] = []
+
+    # Strip fenced code blocks (json / tool_call / tool_use / blank fence).
+    fence_re = re.compile(r"```(?:json|tool_call|tool_use|tool|functions?)?\s*\n?([\s\S]*?)```", re.IGNORECASE)
+    for m in fence_re.finditer(text):
+        candidates.append(m.group(1).strip())
+
+    # Bare JSON at the start
+    stripped = text
+    for prefix in (
+        "<tool_call>", "<tool_use>", "[TOOL_CALLS]", "TOOL_CALLS:", "Tool call:", "Action:",
+    ):
+        if stripped.lower().startswith(prefix.lower()):
+            stripped = stripped[len(prefix):].strip()
+    if stripped.startswith("{") or stripped.startswith("["):
+        candidates.insert(0, stripped)
+
+    out: list[ToolCall] = []
+    seen = set()
+    for raw in candidates:
+        # Try to find the largest balanced JSON object / array.
+        for start_char, end_char in (("[", "]"), ("{", "}")):
+            i = raw.find(start_char)
+            if i < 0:
+                continue
+            depth = 0
+            for j in range(i, len(raw)):
+                if raw[j] == start_char:
+                    depth += 1
+                elif raw[j] == end_char:
+                    depth -= 1
+                    if depth == 0:
+                        chunk = raw[i : j + 1]
+                        try:
+                            data = json.loads(chunk)
+                        except json.JSONDecodeError:
+                            break
+                        for call in _normalize_tool_call_object(data):
+                            key = (call.name, json.dumps(call.arguments, sort_keys=True))
+                            if key in seen:
+                                continue
+                            seen.add(key)
+                            if not call.id:
+                                call.id = f"call_{uuid.uuid4().hex[:8]}"
+                            out.append(call)
+                        break
+        if out:
+            break
+    return out
+
+
+def _normalize_tool_call_object(obj: Any) -> list[ToolCall]:
+    """Accept various shapes and return ToolCall list."""
+    if isinstance(obj, list):
+        out: list[ToolCall] = []
+        for o in obj:
+            out.extend(_normalize_tool_call_object(o))
+        return out
+    if not isinstance(obj, dict):
+        return []
+    # OpenAI nested form
+    if "function" in obj and isinstance(obj["function"], dict):
+        fn = obj["function"]
+        name = fn.get("name", "")
+        raw_args = fn.get("arguments", {})
+        return _build_call(obj.get("id", ""), name, raw_args)
+    name = obj.get("name") or obj.get("tool") or obj.get("action")
+    args = obj.get("arguments") or obj.get("parameters") or obj.get("args") or obj.get("input")
+    if name and isinstance(name, str):
+        return _build_call(obj.get("id", ""), name, args if args is not None else {})
+    return []
+
+
+def _build_call(call_id: str, name: str, raw_args: Any) -> list[ToolCall]:
+    if isinstance(raw_args, str):
+        try:
+            parsed = json.loads(raw_args)
+            if not isinstance(parsed, dict):
+                parsed = {"_arg": parsed}
+        except json.JSONDecodeError:
+            parsed = {"_raw": raw_args}
+    elif isinstance(raw_args, dict):
+        parsed = raw_args
+    elif raw_args is None:
+        parsed = {}
+    else:
+        parsed = {"_arg": raw_args}
+    return [ToolCall(id=call_id, name=name, arguments=parsed)]

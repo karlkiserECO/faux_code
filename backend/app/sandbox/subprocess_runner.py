@@ -166,8 +166,11 @@ async def run_python(
     timeout_sec: int = DEFAULT_TIMEOUT_SEC,
 ) -> SandboxResult:
     cwd = _resolve_cwd(workspace)
+    # Note: we deliberately don't pass -I (isolated mode) because it removes
+    # cwd from sys.path, which breaks the common pattern of running a snippet
+    # that imports a file the agent just wrote.
     return await _run(
-        [sys.executable, "-I", "-c", code],
+        [sys.executable, "-u", "-c", code],
         cwd=cwd,
         timeout_sec=timeout_sec,
         shell=False,

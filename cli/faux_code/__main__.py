@@ -265,7 +265,7 @@ def chat(
 def agent(
     goal: str = typer.Argument(..., help="What should the agent do?"),
     provider: Optional[str] = typer.Option(None, "--provider", "-p"),
-    model: str = typer.Option("llama3.2:3b", "--model", "-m"),
+    model: str = typer.Option("qwen2.5-coder:7b-instruct", "--model", "-m"),
     workspace: Optional[str] = typer.Option(None, "--workspace", "-w", help="Workspace directory (default: cwd)."),
     approval_mode: str = typer.Option("require_for_writes", "--approval", help="auto|require_for_writes|require_all"),
     max_steps: int = typer.Option(20, "--max-steps"),
