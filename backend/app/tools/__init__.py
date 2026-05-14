@@ -9,7 +9,7 @@ from .registry import (
 )
 
 # Eagerly import to register all built-in tools.
-from . import web_search, web_fetch, fs as _fs, shell as _shell, python_tool, rag_tool  # noqa: F401
+from . import web_search, web_fetch, fs as _fs, shell as _shell, python_tool, rag_tool, apply_patch, git  # noqa: F401
 
 __all__ = [
     "Tool",

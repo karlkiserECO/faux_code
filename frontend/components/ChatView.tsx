@@ -4,28 +4,36 @@ import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
   ChatMessage,
+  deleteMessageAndAfter,
+  generateConversationTitle,
   getConversation,
   streamChat,
 } from "@/lib/api";
 import { useSettingsStore } from "@/stores/settingsStore";
 import MessageBubble from "./MessageBubble";
 import ModelPicker from "./ModelPicker";
-import { ArrowUp, Square } from "lucide-react";
+import ExamplePrompts from "./ExamplePrompts";
+import SystemPromptPicker from "./SystemPromptPicker";
+import { ArrowUp, Square, Zap } from "lucide-react";
 
 export default function ChatView({ conversationId }: { conversationId?: string }) {
   const router = useRouter();
-  const { provider, model, systemPrompt, temperature } = useSettingsStore();
+  const { provider, model, systemPrompt, temperature, setSystemPrompt } = useSettingsStore();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [streamingText, setStreamingText] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [usage, setUsage] = useState<{ input_tokens: number; output_tokens: number } | null>(null);
+  const [editingId, setEditingId] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const inputRef = useRef<HTMLTextAreaElement | null>(null);
 
   useEffect(() => {
     if (!conversationId) {
       setMessages([]);
+      setUsage(null);
       return;
     }
     getConversation(conversationId)
@@ -37,29 +45,27 @@ export default function ChatView({ conversationId }: { conversationId?: string }
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, streamingText]);
 
-  async function send() {
-    const text = input.trim();
-    if (!text || busy) return;
-    setError(null);
-    const userMsg: ChatMessage = { role: "user", content: text };
-    const newMessages = [...messages, userMsg];
-    setMessages(newMessages);
-    setInput("");
+  async function runStream(history: ChatMessage[], targetConvId: string | undefined) {
     setBusy(true);
     setStreamingText("");
-
+    setError(null);
+    abortRef.current = new AbortController();
     let liveText = "";
-    let newConvId: string | undefined = conversationId;
+    let newConvId: string | undefined = targetConvId;
+    let liveUsage: typeof usage = null;
 
     try {
-      const stream = streamChat({
-        conversation_id: conversationId ?? null,
-        provider,
-        model,
-        messages: newMessages,
-        system_prompt: systemPrompt,
-        temperature,
-      });
+      const stream = streamChat(
+        {
+          conversation_id: targetConvId ?? null,
+          provider,
+          model,
+          messages: history,
+          system_prompt: systemPrompt,
+          temperature,
+        },
+        abortRef.current.signal
+      );
 
       for await (const ev of stream) {
         if (ev.event === "conversation") {
@@ -68,7 +74,7 @@ export default function ChatView({ conversationId }: { conversationId?: string }
           liveText += ev.data as string;
           setStreamingText(liveText);
         } else if (ev.event === "finish") {
-          /* nothing */
+          liveUsage = (ev.data as any)?.usage || null;
         } else if (ev.event === "error") {
           setError((ev.data as any).message || "stream error");
         } else if (ev.event === "done") {
@@ -83,53 +89,172 @@ export default function ChatView({ conversationId }: { conversationId?: string }
         model,
       };
       setMessages((m) => [...m, finalMsg]);
+      setUsage(liveUsage);
       setStreamingText("");
 
-      if (!conversationId && newConvId) {
+      if (!targetConvId && newConvId) {
+        // Fire-and-forget title generation, then route to the new convo.
+        generateConversationTitle(newConvId, { provider, model }).catch(() => {});
         router.replace(`/chat/${newConvId}`);
+      } else if (targetConvId && history.length <= 4) {
+        // Re-title after the first couple of turns.
+        generateConversationTitle(targetConvId, { provider, model }).catch(() => {});
       }
     } catch (e: any) {
-      setError(e?.message || String(e));
+      if (e?.name === "AbortError") {
+        // Keep partial text as the assistant message so the user can see it.
+        if (liveText) {
+          setMessages((m) => [
+            ...m,
+            { role: "assistant", content: liveText + "\n\n_(stopped)_", provider, model },
+          ]);
+        }
+        setStreamingText("");
+      } else {
+        setError(e?.message || String(e));
+      }
     } finally {
       setBusy(false);
       abortRef.current = null;
     }
   }
 
+  async function send() {
+    const text = input.trim();
+    if (!text || busy) return;
+    const userMsg: ChatMessage = { role: "user", content: text };
+    const newMessages = [...messages, userMsg];
+    setMessages(newMessages);
+    setInput("");
+    await runStream(newMessages, conversationId);
+  }
+
+  function stop() {
+    if (abortRef.current) {
+      abortRef.current.abort();
+    }
+  }
+
+  async function regenerate() {
+    if (busy || messages.length === 0) return;
+    // Drop the last assistant turn, re-stream from the state before it.
+    const lastAssistantIdx = [...messages].reverse().findIndex((m) => m.role === "assistant");
+    if (lastAssistantIdx < 0) return;
+    const idx = messages.length - 1 - lastAssistantIdx;
+    const toRemove = messages[idx];
+    const trimmed = messages.slice(0, idx);
+    setMessages(trimmed);
+    if (toRemove.id && conversationId) {
+      try {
+        await deleteMessageAndAfter(conversationId, toRemove.id);
+      } catch {}
+    }
+    await runStream(trimmed, conversationId);
+  }
+
+  function startEdit(msg: ChatMessage) {
+    if (!msg.id) return;
+    setEditingId(msg.id);
+  }
+
+  async function applyEdit(msg: ChatMessage, newContent: string) {
+    if (newContent === "__START_EDIT__") {
+      startEdit(msg);
+      return;
+    }
+    setEditingId(null);
+    if (!msg.id) return;
+    const idx = messages.findIndex((m) => m.id === msg.id);
+    if (idx < 0) return;
+    const before = messages.slice(0, idx);
+    const updatedUser: ChatMessage = { ...msg, content: newContent };
+    const newHistory = [...before, updatedUser];
+    setMessages(newHistory);
+    if (conversationId) {
+      try {
+        await deleteMessageAndAfter(conversationId, msg.id);
+      } catch {}
+    }
+    await runStream(newHistory, conversationId);
+  }
+
   function handleKey(e: React.KeyboardEvent<HTMLTextAreaElement>) {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       send();
+    } else if (e.key === "Escape" && busy) {
+      stop();
     }
   }
+
+  function usePrompt(p: string) {
+    setInput(p);
+    inputRef.current?.focus();
+  }
+
+  const lastAssistantIdx = (() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === "assistant") return i;
+    }
+    return -1;
+  })();
 
   return (
     <div className="flex-1 flex flex-col h-screen">
       <header className="flex items-center justify-between px-4 py-3 border-b border-border">
-        <div className="text-sm text-muted">Chat</div>
-        <ModelPicker />
+        <div className="flex items-center gap-2 text-sm">
+          <span className="text-muted">Chat</span>
+          {usage && (
+            <span className="flex items-center gap-1 text-[11px] text-muted px-1.5 py-0.5 rounded-md bg-card border border-border">
+              <Zap size={10} className="text-accent" />
+              {usage.input_tokens || 0} in / {usage.output_tokens || 0} out
+            </span>
+          )}
+        </div>
+        <div className="flex items-center gap-2">
+          <SystemPromptPicker value={systemPrompt} onChange={setSystemPrompt} />
+          <ModelPicker />
+        </div>
       </header>
 
       <main className="flex-1 overflow-y-auto">
         {messages.length === 0 && !streamingText && (
           <div className="h-full flex items-center justify-center text-center px-6">
-            <div>
-              <div className="text-2xl font-semibold mb-2">
-                faux<span className="text-accent">_</span>code
+            <div className="max-w-2xl space-y-6">
+              <div>
+                <div className="text-3xl font-semibold mb-2">
+                  faux<span className="text-accent">_</span>code
+                </div>
+                <div className="text-muted text-sm">
+                  Multi-provider AI workbench. Pick a model up top, type a message, hit
+                  Enter. Add API keys in{" "}
+                  <a className="text-accent underline" href="/settings">
+                    Settings
+                  </a>{" "}
+                  to unlock free remote providers.
+                </div>
               </div>
-              <div className="text-muted max-w-md text-sm">
-                Multi-provider AI chat + agentic coding workbench. Pick a model in the
-                top-right, type a message, hit Enter. Add API keys in{" "}
-                <a className="text-accent underline" href="/settings">
-                  Settings
-                </a>{" "}
-                to unlock free remote providers.
-              </div>
+              <ExamplePrompts onPick={usePrompt} />
             </div>
           </div>
         )}
         {messages.map((m, i) => (
-          <MessageBubble key={i} message={m} />
+          <MessageBubble
+            key={m.id || i}
+            message={m}
+            editing={editingId === m.id && m.role === "user"}
+            onEdit={
+              m.role === "user"
+                ? (txt) => applyEdit(m, txt)
+                : undefined
+            }
+            onCancelEdit={() => setEditingId(null)}
+            onRegenerate={
+              !busy && i === lastAssistantIdx && m.role === "assistant"
+                ? regenerate
+                : undefined
+            }
+          />
         ))}
         {streamingText && (
           <MessageBubble
@@ -148,24 +273,35 @@ export default function ChatView({ conversationId }: { conversationId?: string }
       <footer className="p-3 border-t border-border bg-card/30">
         <div className="relative flex items-end gap-2 max-w-4xl mx-auto">
           <textarea
+            ref={inputRef}
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKey}
-            placeholder="Message faux_code…"
+            placeholder={busy ? "Press Esc to stop, or wait…" : "Message faux_code…"}
             rows={Math.min(8, Math.max(1, input.split("\n").length))}
             className="flex-1 resize-none rounded-lg border border-border bg-background px-3 py-2.5 focus:outline-none focus:ring-1 focus:ring-accent placeholder:text-muted"
           />
-          <button
-            onClick={send}
-            disabled={busy || !input.trim()}
-            className="h-10 w-10 shrink-0 flex items-center justify-center rounded-lg bg-accent text-background disabled:opacity-40 disabled:cursor-not-allowed hover:opacity-90"
-            title="Send"
-          >
-            {busy ? <Square size={16} /> : <ArrowUp size={18} />}
-          </button>
+          {busy ? (
+            <button
+              onClick={stop}
+              className="h-10 w-10 shrink-0 flex items-center justify-center rounded-lg bg-red-500/80 text-white hover:opacity-90"
+              title="Stop (Esc)"
+            >
+              <Square size={16} />
+            </button>
+          ) : (
+            <button
+              onClick={send}
+              disabled={!input.trim()}
+              className="h-10 w-10 shrink-0 flex items-center justify-center rounded-lg bg-accent text-background disabled:opacity-40 disabled:cursor-not-allowed hover:opacity-90"
+              title="Send (Enter)"
+            >
+              <ArrowUp size={18} />
+            </button>
+          )}
         </div>
         <div className="text-[11px] text-muted text-center mt-2">
-          {busy ? "Generating…" : "Enter to send, Shift+Enter for newline."}
+          {busy ? "Generating… press Esc or Stop to cancel." : "Enter to send · Shift+Enter for newline · ↑ to regenerate"}
         </div>
       </footer>
     </div>

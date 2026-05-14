@@ -216,6 +216,112 @@ def rename_conversation(
     return {"ok": True}
 
 
+class PinRequest(BaseModel):
+    pinned: bool
+
+
+@router.patch("/conversations/{conv_id}/pin")
+def pin_conversation(
+    conv_id: str, body: PinRequest, session: Session = Depends(get_session)
+):
+    conv = session.get(Conversation, conv_id)
+    if not conv:
+        raise HTTPException(404, "Not found")
+    conv.pinned = body.pinned
+    session.add(conv)
+    session.commit()
+    return {"ok": True}
+
+
+@router.delete("/conversations/{conv_id}/messages/{msg_id}")
+def delete_message_and_after(
+    conv_id: str, msg_id: str, session: Session = Depends(get_session)
+):
+    """Delete a message and every message after it. Used by 'regenerate' and 'edit'."""
+    target = session.get(Message, msg_id)
+    if not target or target.conversation_id != conv_id:
+        raise HTTPException(404, "Not found")
+    later = session.exec(
+        select(Message)
+        .where(Message.conversation_id == conv_id)
+        .where(Message.created_at >= target.created_at)
+    ).all()
+    for m in later:
+        session.delete(m)
+    session.commit()
+    return {"ok": True, "deleted": len(later)}
+
+
+class TitleRequest(BaseModel):
+    provider: Optional[str] = None
+    model: str
+
+
+@router.post("/conversations/{conv_id}/title")
+async def generate_title(
+    conv_id: str, body: TitleRequest, session: Session = Depends(get_session)
+):
+    """Generate a 3-7 word title from the first user message + assistant reply."""
+    conv = session.get(Conversation, conv_id)
+    if not conv:
+        raise HTTPException(404, "Not found")
+    msgs = session.exec(
+        select(Message)
+        .where(Message.conversation_id == conv_id)
+        .order_by(Message.created_at)
+    ).all()
+    if not msgs:
+        return {"title": conv.title}
+
+    transcript_bits: list[str] = []
+    for m in msgs[:4]:
+        text = (m.content or "").strip()
+        if not text:
+            continue
+        transcript_bits.append(f"{m.role.upper()}: {text[:500]}")
+    transcript = "\n".join(transcript_bits)
+
+    prompt = (
+        "Write a 3-7 word title that summarizes the conversation below. "
+        "Respond with ONLY the title, no quotes, no punctuation at the end.\n\n"
+        f"{transcript}"
+    )
+
+    title_messages = [ChatMessage(role="user", content=prompt)]
+    req = ChatRequest(
+        model=body.model,
+        messages=title_messages,
+        temperature=0.2,
+        max_tokens=24,
+    )
+    text = ""
+    try:
+        from ..router import stream_chat as _stream
+
+        async for chunk in _stream(req, body.provider):
+            if chunk.delta:
+                text += chunk.delta
+            if chunk.finish_reason:
+                break
+    except Exception:
+        text = ""
+    title = text.strip().splitlines()[0] if text.strip() else ""
+    # Strip common LLM preambles like "Title: " or "Here's a title: ".
+    for prefix in ("title:", "title is:", "the title is:", "here is the title:", "here's the title:"):
+        if title.lower().startswith(prefix):
+            title = title[len(prefix):].strip()
+    title = title.strip(' "\'\u201c\u201d`*:-.')
+    if not title:
+        title = _derive_title(
+            [ChatMessage(role=m.role, content=m.content or "") for m in msgs]
+        )
+    title = title[:80]
+    conv.title = title
+    session.add(conv)
+    session.commit()
+    return {"title": title}
+
+
 def _derive_title(messages: list[ChatMessage]) -> str:
     for m in messages:
         if m.role == "user" and m.content:

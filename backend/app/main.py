@@ -80,6 +80,12 @@ def create_app() -> FastAPI:
         app.include_router(workspace_api.router)
     except Exception:
         pass
+    try:
+        from .api import status as status_api  # noqa: F401
+
+        app.include_router(status_api.router)
+    except Exception:
+        pass
 
     @app.get("/healthz")
     async def healthz():

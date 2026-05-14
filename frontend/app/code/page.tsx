@@ -4,6 +4,7 @@ import dynamic from "next/dynamic";
 import { useEffect, useState } from "react";
 import Sidebar from "@/components/Sidebar";
 import FileTree from "@/components/FileTree";
+import DiffViewer from "@/components/DiffViewer";
 import {
   createAgentRun,
   getWorkspaceFile,
@@ -13,7 +14,8 @@ import {
 } from "@/lib/api";
 import { useSettingsStore } from "@/stores/settingsStore";
 import ModelPicker from "@/components/ModelPicker";
-import { FolderOpen, Save, Wand2, Square } from "lucide-react";
+import { FolderOpen, Save, Wand2, Square, X, FileDiff, Code2 } from "lucide-react";
+import clsx from "clsx";
 
 const Monaco = dynamic(() => import("@monaco-editor/react"), { ssr: false });
 
@@ -27,19 +29,27 @@ const EXT_TO_LANG: Record<string, string> = {
   dockerfile: "dockerfile",
 };
 
+type TabState = {
+  path: string;
+  language: string;
+  content: string;       // current editor content
+  saved: string;         // last saved on disk content
+  baseline: string;      // pre-edit content for diff display
+};
+
 export default function CodePage() {
   const { provider, model } = useSettingsStore();
   const [root, setRoot] = useState<string>("");
   const [rootInput, setRootInput] = useState<string>("");
+  const [tabs, setTabs] = useState<TabState[]>([]);
   const [activePath, setActivePath] = useState<string>("");
-  const [content, setContent] = useState<string>("");
-  const [originalContent, setOriginalContent] = useState<string>("");
-  const [language, setLanguage] = useState<string>("plaintext");
+  const [showDiff, setShowDiff] = useState(false);
   const [saving, setSaving] = useState(false);
   const [agentPrompt, setAgentPrompt] = useState("");
   const [agentRunning, setAgentRunning] = useState(false);
   const [agentLog, setAgentLog] = useState<string[]>([]);
   const [agentRunId, setAgentRunId] = useState<string | null>(null);
+  const [touchedPaths, setTouchedPaths] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     getWorkspaceInfo()
@@ -50,25 +60,56 @@ export default function CodePage() {
       .catch(() => {});
   }, []);
 
+  const active = tabs.find((t) => t.path === activePath);
+
   async function openFile(path: string) {
+    const existing = tabs.find((t) => t.path === path);
+    if (existing) {
+      setActivePath(path);
+      setShowDiff(false);
+      return;
+    }
     try {
       const data = await getWorkspaceFile(path, root);
-      setActivePath(path);
-      setContent(data.content);
-      setOriginalContent(data.content);
       const ext = path.split(".").pop()?.toLowerCase() || "";
-      setLanguage(EXT_TO_LANG[ext] || "plaintext");
+      const language = EXT_TO_LANG[ext] || "plaintext";
+      setTabs((prev) => [
+        ...prev,
+        { path, language, content: data.content, saved: data.content, baseline: data.content },
+      ]);
+      setActivePath(path);
+      setShowDiff(false);
     } catch (e) {
       alert(`Failed to open ${path}: ${e}`);
     }
   }
 
+  function closeTab(path: string) {
+    setTabs((prev) => {
+      const next = prev.filter((t) => t.path !== path);
+      if (path === activePath) {
+        setActivePath(next.length ? next[next.length - 1].path : "");
+      }
+      return next;
+    });
+  }
+
+  function updateContent(path: string, content: string) {
+    setTabs((prev) =>
+      prev.map((t) => (t.path === path ? { ...t, content } : t))
+    );
+  }
+
   async function save() {
-    if (!activePath) return;
+    if (!active) return;
     setSaving(true);
     try {
-      await saveWorkspaceFile(activePath, content, root);
-      setOriginalContent(content);
+      await saveWorkspaceFile(active.path, active.content, root);
+      setTabs((prev) =>
+        prev.map((t) =>
+          t.path === active.path ? { ...t, saved: t.content, baseline: t.content } : t
+        )
+      );
     } catch (e: any) {
       alert(`Save failed: ${e.message || e}`);
     } finally {
@@ -76,12 +117,25 @@ export default function CodePage() {
     }
   }
 
+  async function refreshTab(path: string) {
+    try {
+      const data = await getWorkspaceFile(path, root);
+      setTabs((prev) =>
+        prev.map((t) =>
+          t.path === path
+            ? { ...t, content: data.content, saved: data.content }
+            : t
+        )
+      );
+    } catch {}
+  }
+
   function applyRoot() {
     if (rootInput && rootInput !== root) {
       setRoot(rootInput);
+      setTabs([]);
       setActivePath("");
-      setContent("");
-      setOriginalContent("");
+      setTouchedPaths(new Set());
     }
   }
 
@@ -89,24 +143,39 @@ export default function CodePage() {
     if (!agentPrompt.trim() || agentRunning) return;
     setAgentRunning(true);
     setAgentLog([]);
+    setTouchedPaths(new Set());
+    // Snapshot baselines for diff
+    setTabs((prev) => prev.map((t) => ({ ...t, baseline: t.content })));
+
     try {
-      const goal = activePath
-        ? `Working in file \`${activePath}\` (already open in the editor):\n\n${agentPrompt}\n\nUse read_file and edit_file (or write_file) to make changes. After editing, re-read the file to confirm.`
-        : agentPrompt;
+      const openFiles = tabs.map((t) => t.path).join(", ");
+      const context = active
+        ? `Open file: \`${active.path}\`${tabs.length > 1 ? ` (also open: ${openFiles})` : ""}\n\n`
+        : "";
+      const goal = `${context}${agentPrompt}\n\nWhen you finish, re-read any files you changed so I can verify them.`;
       const { id } = await createAgentRun({
         goal,
         provider,
         model,
         workspace: root,
         approval_mode: "auto",
-        allowed_tools: ["list_dir", "read_file", "grep", "write_file", "edit_file", "shell", "python", "web_search", "web_fetch"],
-        max_steps: 20,
+        allowed_tools: [
+          "list_dir", "read_file", "grep", "write_file", "edit_file",
+          "shell", "python", "web_search", "web_fetch",
+          "apply_patch", "git_status", "git_diff", "git_log",
+        ],
+        max_steps: 25,
       });
       setAgentRunId(id);
       let final = "";
+      const localTouched = new Set<string>();
       for await (const ev of streamAgentRun(id)) {
         if (ev.event === "tool_call") {
           setAgentLog((l) => [...l, `→ ${ev.data.name}(${shortArgs(ev.data.arguments)})`]);
+          const path = ev.data.arguments?.path;
+          if (path && (ev.data.name === "write_file" || ev.data.name === "edit_file")) {
+            localTouched.add(path);
+          }
         } else if (ev.event === "tool_result") {
           setAgentLog((l) => [
             ...l,
@@ -122,12 +191,10 @@ export default function CodePage() {
         }
       }
       if (final) setAgentLog((l) => [...l, "", "Summary:", final]);
-      if (activePath) {
-        try {
-          const data = await getWorkspaceFile(activePath, root);
-          setContent(data.content);
-          setOriginalContent(data.content);
-        } catch {}
+      // Refresh any touched tabs that are currently open.
+      setTouchedPaths(localTouched);
+      for (const p of localTouched) {
+        if (tabs.find((t) => t.path === p)) await refreshTab(p);
       }
     } catch (e: any) {
       setAgentLog((l) => [...l, `Error: ${e?.message || e}`]);
@@ -137,7 +204,8 @@ export default function CodePage() {
     }
   }
 
-  const dirty = content !== originalContent;
+  const dirty = active ? active.content !== active.saved : false;
+  const hasDiff = active ? active.content !== active.baseline : false;
 
   return (
     <div className="flex h-screen">
@@ -162,7 +230,7 @@ export default function CodePage() {
             <ModelPicker />
           </div>
         </header>
-        <div className="flex-1 grid grid-cols-[260px_1fr_360px] min-h-0">
+        <div className="flex-1 grid grid-cols-[260px_1fr_380px] min-h-0">
           <aside className="border-r border-border bg-card/30 min-h-0">
             {root ? (
               <FileTree root={root} activePath={activePath} onSelect={openFile} />
@@ -171,29 +239,98 @@ export default function CodePage() {
             )}
           </aside>
           <section className="min-w-0 flex flex-col">
-            <div className="flex items-center justify-between px-3 py-1.5 border-b border-border text-xs">
+            {/* Tab bar */}
+            <div className="flex items-center border-b border-border bg-card/20 overflow-x-auto">
+              {tabs.length === 0 && (
+                <div className="px-3 py-1.5 text-xs text-muted">No file open</div>
+              )}
+              {tabs.map((t) => {
+                const isDirty = t.content !== t.saved;
+                const isTouched = touchedPaths.has(t.path);
+                return (
+                  <div
+                    key={t.path}
+                    onClick={() => {
+                      setActivePath(t.path);
+                      setShowDiff(false);
+                    }}
+                    className={clsx(
+                      "group flex items-center gap-1.5 px-3 py-1.5 border-r border-border text-xs cursor-pointer min-w-0",
+                      activePath === t.path
+                        ? "bg-background"
+                        : "hover:bg-background/60 text-muted"
+                    )}
+                  >
+                    <Code2 size={11} className="shrink-0" />
+                    <span className="truncate max-w-[160px]">{t.path.split("/").pop()}</span>
+                    {isTouched && (
+                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" title="modified by agent" />
+                    )}
+                    {isDirty && (
+                      <span className="w-1.5 h-1.5 rounded-full bg-yellow-400" title="unsaved" />
+                    )}
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        closeTab(t.path);
+                      }}
+                      className="opacity-0 group-hover:opacity-100 hover:text-red-300"
+                    >
+                      <X size={11} />
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+            {/* Toolbar */}
+            <div className="flex items-center justify-between px-3 py-1 border-b border-border text-xs">
               <span className="text-muted truncate">
-                {activePath || "(no file open)"}
+                {active?.path || ""}
               </span>
               <div className="flex items-center gap-2">
-                {dirty && <span className="text-yellow-400">unsaved</span>}
+                {hasDiff && (
+                  <button
+                    onClick={() => setShowDiff((v) => !v)}
+                    className={clsx(
+                      "flex items-center gap-1 px-2 py-1 rounded border",
+                      showDiff
+                        ? "border-accent text-accent"
+                        : "border-border hover:bg-background"
+                    )}
+                  >
+                    <FileDiff size={11} /> {showDiff ? "Hide diff" : "Show diff"}
+                  </button>
+                )}
                 <button
                   onClick={save}
-                  disabled={!dirty || !activePath || saving}
+                  disabled={!dirty || !active || saving}
                   className="flex items-center gap-1 px-2 py-1 rounded border border-border hover:bg-background disabled:opacity-40"
                 >
-                  <Save size={12} /> {saving ? "Saving…" : "Save"}
+                  <Save size={11} /> {saving ? "Saving…" : "Save"}
                 </button>
               </div>
             </div>
+            {/* Editor or diff */}
             <div className="flex-1 min-h-0">
-              {activePath ? (
+              {!active ? (
+                <div className="h-full flex items-center justify-center text-muted text-sm">
+                  Pick a file from the tree.
+                </div>
+              ) : showDiff ? (
+                <div className="h-full overflow-auto p-3 bg-background">
+                  <DiffViewer
+                    oldText={active.baseline}
+                    newText={active.content}
+                    fileName={active.path}
+                  />
+                </div>
+              ) : (
                 <Monaco
                   height="100%"
                   theme="vs-dark"
-                  language={language}
-                  value={content}
-                  onChange={(v) => setContent(v ?? "")}
+                  language={active.language}
+                  value={active.content}
+                  onChange={(v) => updateContent(active.path, v ?? "")}
                   options={{
                     fontSize: 13,
                     minimap: { enabled: false },
@@ -202,10 +339,6 @@ export default function CodePage() {
                     automaticLayout: true,
                   }}
                 />
-              ) : (
-                <div className="h-full flex items-center justify-center text-muted text-sm">
-                  Pick a file from the tree.
-                </div>
               )}
             </div>
           </section>
@@ -217,8 +350,8 @@ export default function CodePage() {
             <div className="flex-1 overflow-y-auto px-3 py-2 text-xs font-mono whitespace-pre-wrap">
               {agentLog.length === 0 ? (
                 <div className="text-muted">
-                  Ask the agent to read or edit files in this workspace. Active file
-                  context is included automatically.
+                  Ask the agent to read or edit files in this workspace. The open
+                  file (and any others in tabs) is included as context.
                 </div>
               ) : (
                 agentLog.join("\n")

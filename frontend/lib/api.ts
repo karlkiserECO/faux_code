@@ -88,6 +88,30 @@ export function renameConversation(id: string, title: string) {
   });
 }
 
+export function pinConversation(id: string, pinned: boolean) {
+  return api(`/v1/conversations/${id}/pin`, {
+    method: "PATCH",
+    body: JSON.stringify({ pinned }),
+  });
+}
+
+export function deleteMessageAndAfter(convId: string, msgId: string) {
+  return api<{ ok: boolean; deleted: number }>(
+    `/v1/conversations/${convId}/messages/${msgId}`,
+    { method: "DELETE" }
+  );
+}
+
+export function generateConversationTitle(
+  convId: string,
+  payload: { provider?: string; model: string }
+) {
+  return api<{ title: string }>(`/v1/conversations/${convId}/title`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
 export function getKeys() {
   return api<Record<string, { set: boolean; preview: string }>>("/v1/settings/keys");
 }
@@ -280,20 +304,96 @@ export function deleteRagCollection(name: string) {
   return api(`/v1/rag/collections/${name}`, { method: "DELETE" });
 }
 
-export async function* streamChat(payload: {
-  conversation_id?: string | null;
-  provider?: string;
-  model: string;
-  messages: ChatMessage[];
-  system_prompt?: string;
-  tools?: unknown[];
-  fallback?: string[];
-  temperature?: number;
-}): AsyncGenerator<ChatStreamEvent> {
+export type SystemStatus = {
+  ollama: {
+    base_url: string;
+    alive: boolean;
+    models_installed: string[];
+    default_chat: string;
+    default_code: string;
+    default_embed: string;
+  };
+  providers: {
+    id: string;
+    name: string;
+    enabled: boolean;
+    requires_key: boolean;
+    description: string;
+  }[];
+  workspace_root: string;
+  data_dir: string;
+};
+
+export type RecommendedModel = {
+  id: string;
+  role: string;
+  description: string;
+  size_gb: number;
+};
+
+export function getSystemStatus() {
+  return api<SystemStatus>("/v1/status/system");
+}
+
+export function getRecommendedModels() {
+  return api<RecommendedModel[]>("/v1/status/ollama/recommended");
+}
+
+export async function* streamPullModel(
+  model: string
+): AsyncGenerator<{ event: string; data: any }> {
+  const res = await fetch(`${API_BASE}/v1/status/ollama/pull`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model }),
+  });
+  if (!res.ok || !res.body) throw new Error(`pull ${res.status}`);
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const blocks = buf.split("\n\n");
+    buf = blocks.pop() ?? "";
+    for (const block of blocks) {
+      const lines = block.split("\n");
+      let event = "message";
+      const dataLines: string[] = [];
+      for (const line of lines) {
+        if (line.startsWith("event:")) event = line.slice(6).trim();
+        else if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /, ""));
+      }
+      const raw = dataLines.join("\n");
+      let data: any = raw;
+      if (raw && (raw.startsWith("{") || raw.startsWith("["))) {
+        try { data = JSON.parse(raw); } catch { /* keep */ }
+      }
+      yield { event, data };
+      if (event === "done") return;
+    }
+  }
+}
+
+export async function* streamChat(
+  payload: {
+    conversation_id?: string | null;
+    provider?: string;
+    model: string;
+    messages: ChatMessage[];
+    system_prompt?: string;
+    tools?: unknown[];
+    fallback?: string[];
+    temperature?: number;
+  },
+  signal?: AbortSignal
+): AsyncGenerator<ChatStreamEvent> {
   const res = await fetch(`${API_BASE}/v1/chat/completions`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
+    signal,
   });
   if (!res.ok || !res.body) {
     const text = await res.text().catch(() => "");
